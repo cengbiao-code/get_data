@@ -18,6 +18,7 @@ class FakeSource:
         return {
             "company_symbol": company.symbol,
             "market": company.market,
+            "company_name": payload.get("company_name"),
             "source": payload["source"],
             "source_url": payload.get("source_url"),
             "source_confidence": payload["source_confidence"],
@@ -111,12 +112,13 @@ class RefresherTests(unittest.TestCase):
 
             summary = refresher.refresh_companies(
                 db_path,
-                [WatchlistCompany("AAPL", "US", "Apple Inc.", True)],
+                [WatchlistCompany("AAPL", "US", "AAPL", True)],
                 sources={
                     "US": FakeSource(
                         {
                             "AAPL": {
                                 "source": "SEC CompanyFacts",
+                                "company_name": "Apple Inc.",
                                 "source_confidence": "official",
                                 "facts": [
                                     {
@@ -134,10 +136,14 @@ class RefresherTests(unittest.TestCase):
 
             with closing(db.connect(db_path)) as conn:
                 company_count = conn.execute("select count(*) from companies").fetchone()[0]
+                company_name = conn.execute(
+                    "select name from companies where symbol = 'AAPL'"
+                ).fetchone()["name"]
                 fact_count = conn.execute("select count(*) from financial_facts").fetchone()[0]
 
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual(company_count, 1)
+            self.assertEqual(company_name, "Apple Inc.")
             self.assertEqual(fact_count, 1)
 
     def test_refresh_companies_can_filter_to_specific_report_period(self):

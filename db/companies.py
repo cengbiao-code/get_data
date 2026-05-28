@@ -40,7 +40,15 @@ def sync_companies(db_path: str | Path, companies: Iterable[Any]) -> None:
             insert into companies(symbol, market, name, enabled, notes, updated_at)
             values(?, ?, ?, ?, ?, ?)
             on conflict(symbol, market) do update set
-                name = excluded.name,
+                name = case
+                    when excluded.name is null or excluded.name = '' then companies.name
+                    when excluded.name = excluded.symbol
+                         and companies.name is not null
+                         and companies.name != ''
+                         and companies.name != companies.symbol
+                        then companies.name
+                    else excluded.name
+                end,
                 enabled = excluded.enabled,
                 notes = excluded.notes,
                 updated_at = excluded.updated_at
@@ -48,6 +56,32 @@ def sync_companies(db_path: str | Path, companies: Iterable[Any]) -> None:
             rows,
         )
         conn.commit()
+
+
+def update_company_name_if_placeholder(
+    db_path: str | Path,
+    *,
+    symbol: str,
+    market: str,
+    name: str | None,
+) -> bool:
+    clean_name = (name or "").strip()
+    if not clean_name or clean_name == symbol:
+        return False
+    now = utc_now()
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            update companies
+            set name = ?, updated_at = ?
+            where symbol = ?
+              and market = ?
+              and (name is null or name = '' or name = symbol)
+            """,
+            (clean_name, now, symbol, market),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def get_company_id(conn: sqlite3.Connection, symbol: str, market: str) -> int:

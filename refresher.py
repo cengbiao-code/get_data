@@ -67,6 +67,12 @@ def _refresh_company(
 ) -> int:
     payload = normalizer.prepare_structured_payload(source.fetch(company))
     payload["fetch_run_id"] = fetch_run_id
+    db.update_company_name_if_placeholder(
+        db_path,
+        symbol=company.symbol,
+        market=company.market,
+        name=payload.get("company_name"),
+    )
     db.insert_raw_payload(db_path, payload)
     facts = normalizer.normalize_structured_payload(payload)
     facts = _filter_facts(facts, report_period=report_period, history_scope=history_scope)

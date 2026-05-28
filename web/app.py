@@ -3,8 +3,11 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 import re
+import zipfile
 from urllib.parse import parse_qs, quote, urlsplit
 
+from crawler.runner import crawl_disclosures_from_database
+import exporter
 from models import WatchlistCompany
 import refresher
 import validator
@@ -13,9 +16,10 @@ from web import queries
 
 try:
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, Response
 except ModuleNotFoundError:
     FastAPI = None
+    FileResponse = None
     HTMLResponse = None
     Response = None
 
@@ -116,6 +120,11 @@ RUN_STATUS_LABELS = {
     "partial_failed": "部分失败",
     "failed": "失败",
     "running": "运行中",
+}
+VALIDATION_STATUS_LABELS = {
+    "passed": "通过",
+    "warning": "警告",
+    "failed": "失败",
 }
 
 
@@ -288,6 +297,18 @@ def render_command_center(
     )
 
 
+def render_crawler_action_panel() -> str:
+    return (
+        "<section class=\"panel crawler-action-panel\">"
+        "<div class=\"panel-header\"><div><h2>爬虫补充披露</h2>"
+        "<div class=\"muted\">按当前公司列表采集公告元数据和文档 hash，不写入可信财务事实。</div></div>"
+        "<form method=\"post\" action=\"/crawl-disclosures\">"
+        "<button type=\"submit\">运行爬虫</button>"
+        "</form></div>"
+        "</section>"
+    )
+
+
 def render_period_filter_form(symbol: str, report_period: str = "") -> str:
     return (
         "<form class=\"inline-filter\" method=\"get\" action=\"/search\">"
@@ -298,47 +319,101 @@ def render_period_filter_form(symbol: str, report_period: str = "") -> str:
     )
 
 
+def render_period_validation_form(symbol: str, report_period: str) -> str:
+    return (
+        "<form class=\"inline-filter\" method=\"post\" "
+        f"action=\"/validate?symbol={quote(symbol)}&report_period={quote(report_period)}\">"
+        f"<input type=\"hidden\" name=\"symbol\" value=\"{escape(symbol)}\" />"
+        f"<input type=\"hidden\" name=\"report_period\" value=\"{escape(report_period)}\" />"
+        "<button type=\"submit\">验证本期报表</button>"
+        "</form>"
+    )
+
+
 def render_quality_summary(quality: dict[str, int]) -> str:
     return (
-        "<section class=\"quality-summary\" aria-label=\"数据质量状态\">"
+        "<section class=\"quality-status-panel\" aria-label=\"数据质量状态说明\">"
+        "<div class=\"quality-summary\">"
         f"<span class=\"chip\">可信：{quality['trusted']}</span>"
         f"<span class=\"chip\">可用：{quality['usable']}</span>"
         f"<span class=\"chip\">需复核：{quality['needs_review']}</span>"
         f"<span class=\"chip\">已滞后：{quality['stale']}</span>"
         f"<span class=\"chip\">失败：{quality['failed']}</span>"
+        "</div>"
+        "<div class=\"quality-help\">"
+        "<strong>状态怎么得出</strong>"
+        "<ul>"
+        "<li><span>可信</span>：来源、抓取时间、payload hash、三大报表和关键校验无错误警告。</li>"
+        "<li><span>可用</span>：通过核心校验，但有 1 条轻微警告；AI 默认导出仍包含。</li>"
+        "<li><span>需复核</span>：出现 2 条及以上警告，或存在缺失、重复、异常跳变等需要人工判断的问题。</li>"
+        "<li><span>已滞后</span>：结构化数据落后于最新披露期间，不能静默当作最新数据。</li>"
+        "<li><span>失败</span>：存在错误级验证结果、关键数据缺失、采集失败或不支持市场。</li>"
+        "</ul>"
+        "<div class=\"muted\">这些数量按公司当前数据状态汇总；验证会把事实行状态按较低可信等级同步，默认导出只取可信和可用。</div>"
+        "</div>"
         "</section>"
     )
 
 
 def render_company_list_panel(db_path: str | Path, company_count: int) -> str:
     rows = queries.get_company_list_summary_rows(db_path)
-    if rows:
-        table_rows = "".join(
-            "<tr>"
-            f"<td><a href=\"/companies/{quote(row['symbol'])}\">{escape(row['symbol'])}</a></td>"
-            f"<td>{escape(row['market'])}</td>"
-            f"<td>{escape(row['name'])}</td>"
-            f"<td>{render_status_badge(row['data_status'])}</td>"
-            f"<td>{escape(row['latest_period'] or '暂无')}</td>"
-            f"<td>{int(row['period_count'])}</td>"
-            "</tr>"
-            for row in rows
-        )
-    else:
-        table_rows = (
-            "<tr><td colspan=\"6\">暂无公司。请先在顶部采集公司数据。</td></tr>"
-        )
     return (
         "<div class=\"company-list-panel\"><section class=\"panel\">"
         "<div class=\"panel-header\"><div><h2>公司列表</h2>"
         f"<div class=\"muted\">已纳入 {company_count} 家公司</div></div>"
         "<a class=\"inline-action\" href=\"/companies\">查看全部</a></div>"
         "<div class=\"panel-body\">"
-        "<table class=\"data-table\"><thead><tr>"
+        f"{render_company_summary_table(rows)}"
+        "</div></section></div>"
+    )
+
+
+def render_company_summary_table(
+    rows,
+    *,
+    coverage: dict[int, list[dict[str, object]]] | None = None,
+) -> str:
+    show_coverage = coverage is not None
+    if rows:
+        table_rows = "".join(
+            render_company_summary_table_row(
+                row,
+                coverage.get(row["id"], []) if coverage is not None else None,
+            )
+            for row in rows
+        )
+    else:
+        table_rows = (
+            "<tr><td colspan=\"6\">暂无公司。请先在工作台采集公司数据。</td></tr>"
+        )
+    class_name = "data-table company-summary-table"
+    if show_coverage:
+        class_name += " expanded"
+    return (
+        f"<table class=\"{class_name}\"><thead><tr>"
         "<th>代码</th><th>市场</th><th>公司</th><th>状态</th><th>最新期间</th><th>期间数</th>"
         "</tr></thead>"
         f"<tbody>{table_rows}</tbody></table>"
-        "</div></section></div>"
+    )
+
+
+def render_company_summary_table_row(row, periods: list[dict[str, object]] | None) -> str:
+    summary_row = (
+        "<tr>"
+        f"<td><a href=\"/companies/{quote(row['symbol'])}\">{escape(row['symbol'])}</a></td>"
+        f"<td>{escape(row['market'])}</td>"
+        f"<td>{escape(row['name'])}</td>"
+        f"<td>{render_status_badge(row['data_status'])}</td>"
+        f"<td>{escape(row['latest_period'] or '暂无')}</td>"
+        f"<td>{int(row['period_count'])}</td>"
+        "</tr>"
+    )
+    if periods is None:
+        return summary_row
+    return summary_row + (
+        "<tr class=\"coverage-row\"><td colspan=\"6\">"
+        f"{render_company_coverage_items(row['symbol'], periods)}"
+        "</td></tr>"
     )
 
 
@@ -348,10 +423,9 @@ def render_dashboard(db_path: str | Path) -> str:
     body = (
         "<div class=\"research-dashboard\">"
         "<div class=\"page-title-row\"><div><h1>本地财务工作台</h1>"
-        "<div class=\"muted\">只保留查询、采集、质量验证和导出前检查。</div></div>"
-        "<form method=\"post\" action=\"/validate\"><button type=\"submit\">运行验证</button></form>"
-        "</div>"
+        "<div class=\"muted\">只保留查询、采集、质量验证和导出前检查。</div></div></div>"
         f"{render_command_center()}"
+        f"{render_crawler_action_panel()}"
         "<section class=\"metrics-row\">"
         f"<div class=\"metric\"><span class=\"metric-value\">{stats['company_count']}</span><span class=\"metric-label\">公司数量</span></div>"
         f"<div class=\"metric\"><span class=\"metric-value\">{quality['trusted'] + quality['usable']}</span><span class=\"metric-label\">AI 默认可导出</span></div>"
@@ -366,36 +440,39 @@ def render_dashboard(db_path: str | Path) -> str:
 
 
 def render_companies(db_path: str | Path) -> str:
-    rows = queries.get_company_rows(db_path)
+    rows = queries.get_company_list_summary_rows(db_path)
     coverage = queries.get_all_company_period_coverage(db_path)
-    items = ""
-    for row in rows:
-        items += render_company_list_row(row, coverage.get(row["id"], []))
-    if not items:
-        items = "<div class=\"panel empty-state\">暂无公司。请先在顶部采集或刷新数据。</div>"
     body = (
         "<div class=\"page-title-row\"><div><h1>公司列表</h1>"
-        "<div class=\"muted\">逐家公司检查已采集期间、已采集报表和缺失报表。</div></div></div>"
-        "<section class=\"period-coverage-panel\">"
-        "<div class=\"panel-header\"><div><h2>期间覆盖</h2>"
-        "<div class=\"muted\">每家公司按报告期展示三大财报覆盖。</div></div></div>"
-        f"<div class=\"company-page-list\">{items}</div>"
+        "<div class=\"muted\">首页公司列表的完整展开版，逐家公司查看报告期覆盖。</div></div></div>"
+        "<section class=\"panel company-list-panel\">"
+        "<div class=\"panel-header\"><div><h2>全部公司</h2>"
+        "<div class=\"muted\">每家公司下方展开已采集期间、已采集报表和缺失报表。</div></div></div>"
+        "<div class=\"panel-body\">"
+        f"{render_company_summary_table(rows, coverage=coverage)}"
+        "</div>"
         "</section>"
     )
     return render_page("公司列表", body)
 
 
-def render_company_coverage_items(periods: list[dict[str, object]]) -> str:
+def render_company_coverage_items(symbol: str, periods: list[dict[str, object]]) -> str:
     if not periods:
-        return "<li>暂无采集期间；缺失报表：利润表、资产负债表、现金流量表</li>"
-    return "".join(
+        return (
+            "<ul class=\"coverage-list\"><li>"
+            "暂无采集期间；缺失报表：利润表、资产负债表、现金流量表"
+            "</li></ul>"
+        )
+    items = "".join(
         "<li>"
-        f"已采集期间：{escape(str(item['report_period']))}；"
+        f"<a href=\"/companies/{quote(symbol)}?report_period={quote(str(item['report_period']))}\">"
+        f"已采集期间：{escape(str(item['report_period']))}</a>；"
         f"已采集报表：{escape('、'.join(_label(STATEMENT_LABELS, value) for value in item['statements']))}；"
         f"缺失报表：{escape('、'.join(_label(STATEMENT_LABELS, value) for value in item['missing']) or '无')}"
         "</li>"
         for item in periods
     )
+    return f"<ul class=\"coverage-list\">{items}</ul>"
 
 
 def render_company_list_row(row, periods: list[dict[str, object]]) -> str:
@@ -409,7 +486,7 @@ def render_company_list_row(row, periods: list[dict[str, object]]) -> str:
         "</div>"
         f"{render_status_badge(row['data_status'])}"
         "</div>"
-        f"<ul class=\"coverage-list\">{render_company_coverage_items(periods)}</ul>"
+        f"{render_company_coverage_items(row['symbol'], periods)}"
         "</article>"
     )
 
@@ -570,6 +647,7 @@ def render_company_detail(
         f"{render_company_header(company, '公司财务事实按三大报表分标签展示。', '/companies', '返回公司列表')}"
         f"{render_company_summary(company, '当前财报期间', normalized_period)}"
         f"{render_period_filter_form(company['symbol'], normalized_period)}"
+        f"{render_period_validation_form(company['symbol'], normalized_period)}"
         "<section class=\"panel\">"
         "<div class=\"panel-header\"><div><h2>财报表格</h2>"
         "<div class=\"muted\">利润表、资产负债表、现金流量表分标签查看。</div></div></div>"
@@ -706,8 +784,7 @@ def render_validation_issues(db_path: str | Path) -> str:
     items = render_validation_issue_rows(rows)
     body = (
         "<div class=\"page-title-row\"><div><h1>验证问题</h1>"
-        "<div class=\"muted\">最近 100 条验证结果。</div></div>"
-        "<form method=\"post\" action=\"/validate\"><button type=\"submit\">运行验证</button></form></div>"
+        "<div class=\"muted\">最近 100 条验证结果。请在公司详情的具体财报期间运行验证。</div></div></div>"
         "<section class=\"panel\"><table class=\"data-table\"><thead><tr>"
         "<th>公司</th><th>规则</th><th>状态</th><th>消息</th>"
         f"</tr></thead><tbody>{items}</tbody></table></section>"
@@ -720,12 +797,110 @@ def render_validation_issue_rows(rows) -> str:
         "<tr>"
         f"<td>{escape(row['symbol'])}</td>"
         f"<td>{escape(row['rule_name'])}</td>"
-        f"<td>{escape(row['status'])}</td>"
-        f"<td>{escape(row['message'])}</td>"
+        f"<td>{escape(_label(VALIDATION_STATUS_LABELS, row['status']))}</td>"
+        f"<td>{escape(translate_validation_message(row['message']))}</td>"
         "</tr>"
         for row in rows
     )
     return items or "<tr><td colspan=\"4\">暂无验证结果。</td></tr>"
+
+
+def render_validation_result_table(rows) -> str:
+    items = "".join(
+        "<tr>"
+        f"<td>{escape(row['rule_name'])}</td>"
+        f"<td>{escape(_label(VALIDATION_STATUS_LABELS, row['status']))}</td>"
+        f"<td>{escape(_severity_label(row['severity']))}</td>"
+        f"<td>{escape(row['report_period'] or '全公司')}</td>"
+        f"<td>{escape(translate_validation_message(row['message']))}</td>"
+        "</tr>"
+        for row in rows
+    )
+    if not items:
+        items = "<tr><td colspan=\"5\">本次范围内暂无验证问题。</td></tr>"
+    return (
+        "<section class=\"panel validation-result-panel\">"
+        "<div class=\"panel-header\"><div><h2>本次验证结果</h2>"
+        "<div class=\"muted\">按规则列出状态、严重程度和具体原因。</div></div></div>"
+        "<table class=\"data-table\"><thead><tr>"
+        "<th>规则</th><th>状态</th><th>严重程度</th><th>期间</th><th>消息</th>"
+        f"</tr></thead><tbody>{items}</tbody></table></section>"
+    )
+
+
+def _severity_label(value: str | None) -> str:
+    return {
+        "low": "低",
+        "medium": "中",
+        "high": "高",
+    }.get(value or "", value or "")
+
+
+def translate_validation_message(message: str | None) -> str:
+    text = message or ""
+    if text.startswith("Missing key fields: "):
+        fields = text.removeprefix("Missing key fields: ").split(", ")
+        return "缺失关键字段：" + "、".join(_line_item_label(field) for field in fields)
+    if text.startswith("Missing statements: "):
+        statements = text.removeprefix("Missing statements: ").split(", ")
+        return "缺失报表：" + "、".join(_label(STATEMENT_LABELS, item) for item in statements)
+    if text == "No financial facts found for enabled company":
+        return "启用公司暂无财务事实数据"
+
+    duplicate = re.fullmatch(r"(\d+) duplicate period rows detected", text)
+    if duplicate:
+        return f"发现 {duplicate.group(1)} 条重复报告期记录"
+
+    missing_fact_field = re.fullmatch(r"(\d+) facts missing ([A-Za-z_]+)", text)
+    if missing_fact_field:
+        field = _source_field_label(missing_fact_field.group(2))
+        return f"有 {missing_fact_field.group(1)} 条财务事实缺失 {field}"
+
+    stale = re.fullmatch(r"(\d+) facts are marked stale", text)
+    if stale:
+        return f"有 {stale.group(1)} 条财务事实被标记为数据滞后"
+
+    balance = re.fullmatch(
+        r"Balance sheet does not balance for ([^:]+): assets=([^,]+), liabilities=([^,]+), equity=(.+)",
+        text,
+    )
+    if balance:
+        return (
+            f"{balance.group(1)} 资产负债表不平衡："
+            f"资产={balance.group(2)}，负债={balance.group(3)}，权益={balance.group(4)}"
+        )
+
+    large_change = re.fullmatch(
+        r"Large change detected for (.+): previous=([^,]+), current=(.+)",
+        text,
+    )
+    if large_change:
+        return (
+            f"{_line_item_label(large_change.group(1))} 出现异常跳变："
+            f"上期={large_change.group(2)}，本期={large_change.group(3)}"
+        )
+
+    revision = re.fullmatch(r"Payload hash changed for ([^ ]+) ([^ ]+) ([^ ]+)", text)
+    if revision:
+        return (
+            f"{revision.group(3)} 的{_label(STATEMENT_LABELS, revision.group(1))}"
+            f" {_line_item_label(revision.group(2))} 来源 payload hash 发生变化"
+        )
+
+    return text
+
+
+def _line_item_label(value: str) -> str:
+    return _label(LINE_ITEM_LABELS, value)
+
+
+def _source_field_label(value: str) -> str:
+    labels = {
+        "source": "来源",
+        "fetched_at": "抓取时间",
+        "payload_hash": "payload hash",
+    }
+    return labels.get(value, value)
 
 
 def render_runs(db_path: str | Path) -> str:
@@ -774,41 +949,218 @@ def render_crawler_run_rows(crawler_runs) -> str:
     return rows or "<tr><td colspan=\"5\">暂无爬虫任务。</td></tr>"
 
 
-def render_export_page(db_path: str | Path) -> str:
-    options = render_export_options(queries.get_export_company_rows(db_path))
+def run_crawler_from_web(
+    db_path: str | Path,
+    *,
+    crawler_factory=None,
+) -> str:
+    summary = crawl_disclosures_from_database(
+        db_path,
+        crawler_factory=crawler_factory,
+    )
+    body = (
+        "<div class=\"page-title-row\"><div><h1>爬虫完成</h1>"
+        "<div class=\"muted\">已按当前本地公司列表运行披露元数据爬虫。</div></div>"
+        "<a class=\"inline-action\" href=\"/\">返回工作台</a></div>"
+        "<section class=\"metrics-row\">"
+        f"<div class=\"metric\"><span class=\"metric-value\">{summary['companies_loaded']}</span><span class=\"metric-label\">公司数量</span></div>"
+        f"<div class=\"metric\"><span class=\"metric-value\">{summary['success_count']}</span><span class=\"metric-label\">成功</span></div>"
+        f"<div class=\"metric\"><span class=\"metric-value\">{summary['skipped_count']}</span><span class=\"metric-label\">跳过</span></div>"
+        f"<div class=\"metric\"><span class=\"metric-value\">{summary['documents_saved']}</span><span class=\"metric-label\">保存文档</span></div>"
+        "</section>"
+        "<section class=\"panel\"><div class=\"panel-header\"><div><h2>运行结果</h2>"
+        "<div class=\"muted\">失败数包括未启用或合规状态不允许的来源。</div></div></div>"
+        "<div class=\"panel-body\">"
+        f"<span class=\"chip\">失败：{summary['failure_count']}</span>"
+        "<a class=\"inline-action\" href=\"/runs\">查看运行记录</a>"
+        "</div></section>"
+    )
+    return render_page("爬虫完成", body)
+
+
+def parse_export_formats(value: str) -> list[str]:
+    selected = [item.strip() for item in value.split(",") if item.strip()]
+    return [item for item in selected if item in {"csv", "jsonl"}] or ["csv"]
+
+
+def build_export_download(
+    db_path: str | Path,
+    *,
+    symbol: str,
+    report_period: str = "",
+    format_value: str = "csv,jsonl",
+) -> Path:
+    selected_formats = parse_export_formats(format_value)
+    out_dir = Path(db_path).parent / "exports"
+    files = exporter.export_facts(
+        db_path,
+        out_dir,
+        symbol=symbol,
+        report_period=report_period or None,
+        formats=selected_formats,
+    )
+    if len(files) == 1:
+        return next(iter(files.values()))
+    stem = symbol.upper() if symbol else "financial_facts"
+    if report_period:
+        stem = f"{stem}_{report_period.upper()}"
+    zip_path = out_dir / f"{stem}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files.values():
+            archive.write(path, arcname=path.name)
+    return zip_path
+
+
+def render_export_page(
+    db_path: str | Path,
+    *,
+    symbol: str = "",
+    format_value: str = "csv,jsonl",
+    report_period: str = "",
+) -> str:
+    companies = queries.get_export_company_rows(db_path)
+    periods = queries.get_export_period_rows(db_path)
+    options = render_export_options(companies, selected_symbol=symbol)
+    period_options = render_export_period_options(periods)
     body = (
         "<div class=\"page-title-row\"><div><h1>导出</h1>"
         "<div class=\"muted\">默认导出 trusted 和 usable 财务事实。</div></div></div>"
-        "<form class=\"form-card panel\" method=\"get\" action=\"/export\">"
+        "<form class=\"form-card panel\" method=\"get\" action=\"/export/download\">"
         "<div class=\"form-grid\"><div class=\"field field-wide\">"
         "<label for=\"export-symbol\">公司</label>"
         f"<select id=\"export-symbol\" name=\"symbol\">{options}</select></div>"
+        "<div class=\"field field-wide\"><label for=\"export-period\">财报期间</label>"
+        f"<input id=\"export-period\" name=\"report_period\" list=\"export-period-options\" value=\"{escape(report_period)}\" "
+        "placeholder=\"选择或填写，如 2026Q1；留空导出全部\" />"
+        f"<datalist id=\"export-period-options\">{period_options}</datalist></div>"
+        "<div class=\"field field-wide\"><label for=\"export-format\">格式</label>"
+        "<select id=\"export-format\" name=\"format\">"
+        "<option value=\"csv,jsonl\">CSV + JSONL</option>"
+        "<option value=\"csv\">CSV</option>"
+        "<option value=\"jsonl\">JSONL</option>"
+        "</select></div>"
         "<div class=\"field field-wide\"><button type=\"submit\">导出</button></div></div>"
         "</form>"
     )
     return render_page("导出", body)
 
 
-def render_export_options(companies) -> str:
+def render_export_options(companies, *, selected_symbol: str = "") -> str:
     return "".join(
-        f"<option value=\"{escape(row['symbol'])}\">{escape(row['symbol'])} {escape(row['market'])} {escape(row['name'])}</option>"
+        f"<option value=\"{escape(row['symbol'])}\"{' selected' if row['symbol'] == selected_symbol else ''}>"
+        f"{escape(row['symbol'])} {escape(row['market'])} {escape(row['name'])}</option>"
         for row in companies
     )
 
 
-def run_manual_validation(db_path: str | Path) -> str:
-    summary = validator.run_validation(db_path)
-    body = (
-        "<div class=\"page-title-row\"><div><h1>验证完成</h1>"
-        f"<div class=\"muted\">{escape(str(summary))}</div></div>"
-        "<a class=\"inline-action\" href=\"/validation-issues\">查看验证问题</a></div>"
+def render_export_period_options(periods) -> str:
+    return "".join(
+        f"<option value=\"{escape(row['report_period'])}\"></option>"
+        for row in periods
     )
-    return render_page("验证完成", body)
 
 
-def create_app(db_path: str | Path, *, refresh_sources=None):
+def run_manual_validation(
+    db_path: str | Path,
+    *,
+    symbol: str = "",
+    report_period: str = "",
+) -> str:
+    summary = validator.run_validation(
+        db_path,
+        symbol=symbol or None,
+        report_period=report_period or None,
+    )
+    back_link = (
+        f"/companies/{quote(symbol.upper())}?report_period={quote(summary['report_period'])}"
+        if symbol and summary["report_period"]
+        else "/validation-issues"
+    )
+    back_label = "返回本期报表" if symbol and summary["report_period"] else "查看验证问题"
+    scope_text = (
+        f"公司 {summary['symbol']}，财报期间 {summary['report_period']}"
+        if summary["symbol"] and summary["report_period"]
+        else "全部启用公司"
+    )
+    return render_validation_result_page(
+        db_path,
+        title="验证完成",
+        scope_text=scope_text,
+        back_link=back_link,
+        back_label=back_label,
+        symbol=summary["symbol"],
+        report_period=summary["report_period"],
+        companies_checked=summary["companies_checked"],
+        results_written=summary["results_written"],
+    )
+
+
+def render_validation_result_page(
+    db_path: str | Path,
+    *,
+    title: str,
+    scope_text: str,
+    back_link: str,
+    back_label: str,
+    symbol: str | None = None,
+    report_period: str | None = None,
+    companies_checked: int | None = None,
+    results_written: int | None = None,
+) -> str:
+    rows = queries.get_validation_result_rows(
+        db_path,
+        symbol=symbol,
+        report_period=report_period,
+    )
+    counts = ""
+    if companies_checked is not None and results_written is not None:
+        counts = f"；检查公司 {companies_checked} 家，写入结果 {results_written} 条"
+    body = (
+        f"<div class=\"page-title-row\"><div><h1>{escape(title)}</h1>"
+        f"<div class=\"muted\">{escape(scope_text)}{escape(counts)}。</div></div>"
+        f"<a class=\"inline-action\" href=\"{escape(back_link)}\">{escape(back_label)}</a></div>"
+        f"{render_validation_result_table(rows)}"
+    )
+    return render_page(title, body)
+
+
+def render_existing_validation_result(
+    db_path: str | Path,
+    *,
+    symbol: str = "",
+    report_period: str = "",
+) -> str:
+    normalized_symbol = symbol.strip().upper()
+    normalized_period = report_period.strip().upper()
+    back_link = (
+        f"/companies/{quote(normalized_symbol)}?report_period={quote(normalized_period)}"
+        if normalized_symbol and normalized_period
+        else "/validation-issues"
+    )
+    back_label = "返回本期报表" if normalized_symbol and normalized_period else "查看验证问题"
+    scope_text = (
+        f"公司 {normalized_symbol}，财报期间 {normalized_period}"
+        if normalized_symbol and normalized_period
+        else "全部启用公司"
+    )
+    return render_validation_result_page(
+        db_path,
+        title="验证结果",
+        scope_text=scope_text,
+        back_link=back_link,
+        back_label=back_label,
+        symbol=normalized_symbol or None,
+        report_period=normalized_period or None,
+    )
+
+
+def create_app(db_path: str | Path, *, refresh_sources=None, crawler_factory=None):
     if FastAPI is None:
-        return SimpleApp(db_path, refresh_sources=refresh_sources)
+        return SimpleApp(
+            db_path,
+            refresh_sources=refresh_sources,
+            crawler_factory=crawler_factory,
+        )
 
     app = FastAPI(title="Local Financial Database")
     app.state.db_path = str(db_path)
@@ -816,7 +1168,11 @@ def create_app(db_path: str | Path, *, refresh_sources=None):
     app.state.http_get = lambda path: _dispatch_get(
         db_path, path, refresh_sources=refresh_sources
     )
-    app.state.http_post = lambda path: _dispatch_post(db_path, path)
+    app.state.http_post = lambda path: _dispatch_post(
+        db_path,
+        path,
+        crawler_factory=crawler_factory,
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
@@ -878,12 +1234,54 @@ def create_app(db_path: str | Path, *, refresh_sources=None):
         return render_runs(db_path)
 
     @app.get("/export", response_class=HTMLResponse)
-    def export_page():
-        return render_export_page(db_path)
+    def export_page(
+        symbol: str = "",
+        report_period: str = "",
+        format: str = "csv,jsonl",
+    ):
+        return render_export_page(
+            db_path,
+            symbol=symbol,
+            report_period=report_period,
+            format_value=format,
+        )
+
+    @app.get("/export/download")
+    def export_download(
+        symbol: str = "",
+        report_period: str = "",
+        format: str = "csv,jsonl",
+    ):
+        path = build_export_download(
+            db_path,
+            symbol=symbol,
+            report_period=report_period,
+            format_value=format,
+        )
+        return FileResponse(path, filename=path.name)
+
+    @app.get("/validate", response_class=HTMLResponse)
+    def validate_result(symbol: str = "", report_period: str = ""):
+        return render_existing_validation_result(
+            db_path,
+            symbol=symbol,
+            report_period=report_period,
+        )
 
     @app.post("/validate", response_class=HTMLResponse)
-    def validate_now():
-        return run_manual_validation(db_path)
+    def validate_now(symbol: str = "", report_period: str = ""):
+        return run_manual_validation(
+            db_path,
+            symbol=symbol,
+            report_period=report_period,
+        )
+
+    @app.post("/crawl-disclosures", response_class=HTMLResponse)
+    def crawl_disclosures():
+        return run_crawler_from_web(
+            db_path,
+            crawler_factory=crawler_factory,
+        )
 
     return app
 
@@ -931,13 +1329,61 @@ def _dispatch_get(
     if route_path == "/runs":
         return SimpleResponse(200, render_runs(db_path))
     if route_path == "/export":
-        return SimpleResponse(200, render_export_page(db_path))
+        return SimpleResponse(
+            200,
+            render_export_page(
+                db_path,
+                symbol=query.get("symbol", [""])[0],
+                report_period=query.get("report_period", [""])[0],
+                format_value=query.get("format", ["csv,jsonl"])[0],
+            ),
+        )
+    if route_path == "/export/download":
+        path = build_export_download(
+            db_path,
+            symbol=query.get("symbol", [""])[0],
+            report_period=query.get("report_period", [""])[0],
+            format_value=query.get("format", ["csv,jsonl"])[0],
+        )
+        return SimpleResponse(200, f"download:{path}")
+    if route_path == "/validate":
+        return SimpleResponse(
+            200,
+            render_existing_validation_result(
+                db_path,
+                symbol=query.get("symbol", [""])[0],
+                report_period=query.get("report_period", [""])[0],
+            ),
+        )
     return SimpleResponse(404, "<html><body><h1>Not Found</h1></body></html>")
 
 
-def _dispatch_post(db_path: str | Path, path: str) -> SimpleResponse:
-    if path == "/validate":
-        return SimpleResponse(200, run_manual_validation(db_path))
+def _dispatch_post(
+    db_path: str | Path,
+    path: str,
+    *,
+    crawler_factory=None,
+) -> SimpleResponse:
+    parsed = urlsplit(path)
+    route_path = parsed.path
+    query = parse_qs(parsed.query)
+    if route_path == "/validate":
+        return SimpleResponse(
+            200,
+            run_manual_validation(
+                db_path,
+                symbol=query.get("symbol", [""])[0],
+                report_period=query.get("report_period", [""])[0],
+            ),
+        )
+    if route_path == "/crawl-disclosures":
+        return SimpleResponse(
+            200,
+            run_crawler_from_web(
+                db_path,
+                crawler_factory=crawler_factory,
+            ),
+        )
     return SimpleResponse(404, "<html><body><h1>Not Found</h1></body></html>")
 
 
@@ -951,14 +1397,24 @@ class SimpleState:
 
 
 class SimpleApp:
-    def __init__(self, db_path: str | Path, *, refresh_sources=None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        refresh_sources=None,
+        crawler_factory=None,
+    ) -> None:
         self.state = SimpleState()
         self.state.db_path = str(db_path)
         self.state.dashboard_provider = lambda: get_dashboard_stats(db_path)
         self.state.http_get = lambda path: _dispatch_get(
             db_path, path, refresh_sources=refresh_sources
         )
-        self.state.http_post = lambda path: _dispatch_post(db_path, path)
+        self.state.http_post = lambda path: _dispatch_post(
+            db_path,
+            path,
+            crawler_factory=crawler_factory,
+        )
         self.routes = [
             SimpleRoute("/"),
             SimpleRoute("/static/app.css"),
@@ -969,6 +1425,8 @@ class SimpleApp:
             SimpleRoute("/validation-issues"),
             SimpleRoute("/runs"),
             SimpleRoute("/export"),
+            SimpleRoute("/export/download"),
             SimpleRoute("/validate"),
+            SimpleRoute("/crawl-disclosures"),
         ]
 

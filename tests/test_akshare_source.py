@@ -7,8 +7,9 @@ from sources.akshare_source import AKShareSource, AKShareSourceError
 
 
 class FakeAKShareClient:
-    def __init__(self, frames):
+    def __init__(self, frames, names=None):
         self.frames = frames
+        self.names = names or {}
         self.calls = []
 
     def fetch_statement(self, symbol, market, statement_type):
@@ -17,6 +18,9 @@ class FakeAKShareClient:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def resolve_company_name(self, symbol, market):
+        return self.names.get((symbol, market))
 
 
 class AKShareSourceTests(unittest.TestCase):
@@ -56,7 +60,8 @@ class AKShareSourceTests(unittest.TestCase):
                         }
                     ]
                 ),
-            }
+            },
+            names={("600519", "CN"): "贵州茅台"},
         )
         source = AKShareSource(client=client, fetched_at="2026-01-01T00:00:00Z")
 
@@ -65,6 +70,7 @@ class AKShareSourceTests(unittest.TestCase):
         self.assertEqual(payload["source"], "AKShare")
         self.assertEqual(payload["source_confidence"], "structured_open_source")
         self.assertEqual(payload["company_symbol"], "600519")
+        self.assertEqual(payload["company_name"], "贵州茅台")
         self.assertEqual(payload["market"], "CN")
         self.assertEqual(len(payload["facts"]), 3)
         self.assertIn(("600519", "CN", "income_statement"), client.calls)
@@ -122,6 +128,55 @@ class AKShareSourceTests(unittest.TestCase):
         self.assertEqual(payload["facts"], [])
         self.assertEqual(len(payload["payload"]["statements"]), 3)
 
+    def test_akshare_prefers_canonical_alias_when_statement_has_duplicate_line_items(self):
+        client = FakeAKShareClient(
+            {
+                ("CN", "income_statement"): pd.DataFrame(
+                    [
+                        {
+                            "report_period": "20251231",
+                            "line_item": "revenue",
+                            "raw_line_item": "营业总收入",
+                            "value": 172,
+                        },
+                        {
+                            "report_period": "20251231",
+                            "line_item": "revenue",
+                            "raw_line_item": "营业收入",
+                            "value": 168,
+                        },
+                        {
+                            "report_period": "20251231",
+                            "line_item": "net_income",
+                            "raw_line_item": "净利润",
+                            "value": 85,
+                        },
+                        {
+                            "report_period": "20251231",
+                            "line_item": "net_income",
+                            "raw_line_item": "归属于母公司所有者的净利润",
+                            "value": 82,
+                        },
+                    ]
+                ),
+                ("CN", "balance_sheet"): pd.DataFrame(),
+                ("CN", "cash_flow"): pd.DataFrame(),
+            }
+        )
+        source = AKShareSource(client=client, fetched_at="2026-01-01T00:00:00Z")
+
+        payload = source.fetch(WatchlistCompany("600519", "CN", "贵州茅台", True))
+
+        facts = {
+            fact["line_item"]: fact
+            for fact in payload["facts"]
+        }
+        self.assertEqual(len(payload["facts"]), 2)
+        self.assertEqual(facts["revenue"]["value"], 168)
+        self.assertEqual(facts["revenue"]["raw_line_item"], "营业收入")
+        self.assertEqual(facts["net_income"]["value"], 82)
+        self.assertEqual(facts["net_income"]["raw_line_item"], "归属于母公司所有者的净利润")
+
     def test_client_failure_raises_akshare_source_error(self):
         client = FakeAKShareClient(
             {
@@ -134,4 +189,3 @@ class AKShareSourceTests(unittest.TestCase):
 
         with self.assertRaises(AKShareSourceError):
             source.fetch(WatchlistCompany("600519", "CN", "Kweichow Moutai", True))
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from urllib.request import Request, urlopen
 
@@ -224,14 +225,20 @@ class SECSource:
             raise SECSourceError(f"failed to load SEC ticker mapping: {exc}") from exc
         return self._ticker_mapping
 
-    def resolve_cik(self, symbol: str) -> str:
+    def resolve_ticker_entry(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
         mapping = self._load_ticker_mapping()
         entries = mapping.values() if isinstance(mapping, dict) else mapping
         for entry in entries:
             if str(entry.get("ticker", "")).upper() == normalized_symbol:
-                return str(entry["cik_str"]).zfill(10)
+                return entry
         raise SECSourceError(f"SEC CIK not found for symbol {normalized_symbol}")
+
+    def resolve_cik(self, symbol: str) -> str:
+        return str(self.resolve_ticker_entry(symbol)["cik_str"]).zfill(10)
+
+    def resolve_company_name(self, symbol: str) -> str | None:
+        return self.resolve_ticker_entry(symbol).get("title")
 
     def fetch_company_facts(self, symbol: str) -> tuple[str, dict[str, Any]]:
         cik = self.resolve_cik(symbol)
@@ -242,10 +249,12 @@ class SECSource:
             raise SECSourceError(f"failed to fetch SEC CompanyFacts for {symbol}: {exc}") from exc
 
     def fetch(self, company) -> dict[str, Any]:
+        company_name = self.resolve_company_name(company.symbol)
         source_url, companyfacts = self.fetch_company_facts(company.symbol)
         facts = self._companyfacts_to_facts(companyfacts)
         return {
             "company_symbol": company.symbol,
+            "company_name": company_name,
             "market": company.market,
             "source": self.source_name,
             "source_url": source_url,
@@ -257,8 +266,8 @@ class SECSource:
 
     def _companyfacts_to_facts(self, companyfacts: dict[str, Any]) -> list[dict[str, Any]]:
         us_gaap = companyfacts.get("facts", {}).get("us-gaap", {})
-        facts = []
-        for concept, (statement_type, line_item) in self.CONCEPT_MAP.items():
+        candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for concept_index, (concept, (statement_type, line_item)) in enumerate(self.CONCEPT_MAP.items()):
             concept_payload = us_gaap.get(concept)
             if not concept_payload:
                 continue
@@ -267,23 +276,61 @@ class SECSource:
                     if "val" not in row:
                         continue
                     report_period = self._report_period(row)
-                    facts.append(
-                        {
-                            "statement_type": statement_type,
-                            "report_period": report_period,
-                            "fiscal_year": row.get("fy"),
-                            "fiscal_period": row.get("fp"),
-                            "line_item": line_item,
-                            "raw_line_item": concept,
-                            "value": row.get("val"),
-                            "unit": unit,
-                            "currency": unit if len(unit) == 3 else None,
-                            "quality_status": "trusted",
-                            "freshness_status": "unknown",
-                            "validation_status": "trusted",
-                        }
-                    )
-        return facts
+                    fact = {
+                        "statement_type": statement_type,
+                        "report_period": report_period,
+                        "fiscal_year": row.get("fy"),
+                        "fiscal_period": row.get("fp"),
+                        "line_item": line_item,
+                        "raw_line_item": concept,
+                        "value": row.get("val"),
+                        "unit": unit,
+                        "currency": unit if len(unit) == 3 else None,
+                        "quality_status": "trusted",
+                        "freshness_status": "unknown",
+                        "validation_status": "trusted",
+                    }
+                    key = (statement_type, report_period, line_item)
+                    current = candidates.get(key)
+                    if current is None or self._row_rank(row, concept_index) > current["_rank"]:
+                        fact["_rank"] = self._row_rank(row, concept_index)
+                        candidates[key] = fact
+        return [
+            {key: value for key, value in fact.items() if key != "_rank"}
+            for fact in candidates.values()
+        ]
+
+    def _row_rank(self, row: dict[str, Any], concept_index: int) -> tuple:
+        return (
+            self._date_sort_value(row.get("end")),
+            -self._duration_days(row),
+            self._date_sort_value(row.get("filed")),
+            self._form_rank(row.get("form")),
+            1 if row.get("frame") else 0,
+            -concept_index,
+        )
+
+    @staticmethod
+    def _date_sort_value(value: Any) -> int:
+        if not value:
+            return 0
+        try:
+            return int(datetime.strptime(str(value), "%Y-%m-%d").strftime("%Y%m%d"))
+        except ValueError:
+            return 0
+
+    def _duration_days(self, row: dict[str, Any]) -> int:
+        start = self._date_sort_value(row.get("start"))
+        end = self._date_sort_value(row.get("end"))
+        if not start or not end:
+            return 0
+        start_date = datetime.strptime(str(row["start"]), "%Y-%m-%d")
+        end_date = datetime.strptime(str(row["end"]), "%Y-%m-%d")
+        return max((end_date - start_date).days, 0)
+
+    @staticmethod
+    def _form_rank(form: Any) -> int:
+        return {"10-K": 3, "10-Q": 2, "20-F": 2, "40-F": 2}.get(str(form or "").upper(), 0)
 
     def _report_period(self, row: dict[str, Any]) -> str:
         fy = row.get("fy")

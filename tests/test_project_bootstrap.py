@@ -29,6 +29,7 @@ class ProjectBootstrapTests(unittest.TestCase):
         self.assertIn("refresh", result.stdout)
         self.assertIn("validate", result.stdout)
         self.assertIn("crawl-disclosures", result.stdout)
+        self.assertIn("configure-crawler-source", result.stdout)
         self.assertIn("review-candidates", result.stdout)
         self.assertIn("export", result.stdout)
         self.assertIn("serve", result.stdout)
@@ -81,6 +82,51 @@ class ProjectBootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("companies_loaded", result.stdout)
         self.assertNotIn("scaffolded", result.stdout)
+
+    def test_configure_crawler_source_command_records_source_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "financial.sqlite3"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "main.py",
+                    "configure-crawler-source",
+                    "--db",
+                    str(db_path),
+                    "--name",
+                    "cninfo",
+                    "--market",
+                    "CN",
+                    "--compliance-status",
+                    "allowed",
+                    "--enabled",
+                    "true",
+                    "--notes",
+                    "public disclosure metadata only",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                source = conn.execute(
+                    """
+                    select name, market, enabled, compliance_status, notes
+                    from crawler_sources
+                    where name = 'cninfo'
+                    """
+                ).fetchone()
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("cninfo", result.stdout)
+        self.assertEqual(source["name"], "cninfo")
+        self.assertEqual(source["market"], "CN")
+        self.assertEqual(source["enabled"], 1)
+        self.assertEqual(source["compliance_status"], "allowed")
+        self.assertIn("metadata", source["notes"])
 
     def test_watchlist_example_has_required_fields(self):
         path = Path(__file__).resolve().parents[1] / "watchlist.example.csv"

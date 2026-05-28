@@ -180,6 +180,37 @@ def get_validation_issue_rows(db_path: str | Path):
         ).fetchall()
 
 
+def get_validation_result_rows(
+    db_path: str | Path,
+    *,
+    symbol: str | None = None,
+    report_period: str | None = None,
+):
+    filters = []
+    params: list[object] = []
+    if symbol:
+        filters.append("c.symbol = ?")
+        params.append(symbol.upper())
+    if report_period:
+        filters.append("(vr.report_period = ? or vr.report_period is null)")
+        params.append(report_period.upper())
+    where = f"where {' and '.join(filters)}" if filters else ""
+    with db.connect(db_path) as conn:
+        return conn.execute(
+            f"""
+            select coalesce(c.symbol, '') as symbol, vr.rule_name, vr.status,
+                   vr.severity, vr.message, vr.report_period, vr.checked_at
+            from validation_results vr
+            left join companies c on c.id = vr.company_id
+            {where}
+            order by
+                case vr.status when 'failed' then 0 when 'warning' then 1 else 2 end,
+                vr.rule_name
+            """,
+            params,
+        ).fetchall()
+
+
 def get_fetch_run_rows(db_path: str | Path):
     with db.connect(db_path) as conn:
         return conn.execute(
@@ -208,4 +239,15 @@ def get_export_company_rows(db_path: str | Path):
     with db.connect(db_path) as conn:
         return conn.execute(
             "select symbol, market, name from companies order by market, symbol"
+        ).fetchall()
+
+
+def get_export_period_rows(db_path: str | Path):
+    with db.connect(db_path) as conn:
+        return conn.execute(
+            """
+            select distinct report_period
+            from financial_facts
+            order by report_period desc
+            """
         ).fetchall()

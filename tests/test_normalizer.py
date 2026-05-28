@@ -80,7 +80,58 @@ class NormalizerTests(unittest.TestCase):
             self.assertEqual(fact["value"], 100)
             self.assertEqual(fact["source_confidence"], "official")
             self.assertEqual(fact["payload_hash"], payload["payload_hash"])
-            self.assertEqual(fact["version"], 1)
+
+    def test_inserting_same_payload_hash_fact_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "financial.sqlite3"
+            db.init_db(db_path)
+            db.sync_companies(
+                db_path,
+                [
+                    {
+                        "symbol": "AAPL",
+                        "market": "US",
+                        "name": "Apple Inc.",
+                        "enabled": True,
+                        "notes": "",
+                    }
+                ],
+            )
+            fact = {
+                "company_symbol": "AAPL",
+                "market": "US",
+                "statement_type": "income_statement",
+                "report_period": "2026Q2",
+                "fiscal_year": 2026,
+                "fiscal_period": "Q2",
+                "line_item": "revenue",
+                "raw_line_item": "Revenues",
+                "value": 100,
+                "unit": "USD",
+                "currency": "USD",
+                "source": "SEC CompanyFacts",
+                "source_confidence": "official",
+                "payload_hash": "same-hash",
+                "fetched_at": "2026-05-01T00:00:00Z",
+                "quality_status": "trusted",
+            }
+
+            first_id = db.insert_financial_fact(db_path, fact)
+            second_id = db.insert_financial_fact(db_path, {**fact, "value": 101})
+
+            with db.connect(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    select id, value, version
+                    from financial_facts
+                    where company_symbol = 'AAPL'
+                    """
+                ).fetchall()
+
+            self.assertEqual(first_id, second_id)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["value"], 101)
+            self.assertEqual(rows[0]["version"], 1)
 
     def test_akshare_empty_payload_records_quality_issue(self):
         with tempfile.TemporaryDirectory() as tmp:

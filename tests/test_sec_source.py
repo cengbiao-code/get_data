@@ -145,6 +145,7 @@ class SECSourceTests(unittest.TestCase):
         payload = source.fetch(WatchlistCompany("AAPL", "US", "Apple Inc.", True))
 
         self.assertEqual(payload["company_symbol"], "AAPL")
+        self.assertEqual(payload["company_name"], "Apple Inc.")
         self.assertEqual(payload["market"], "US")
         self.assertEqual(payload["source"], "SEC CompanyFacts")
         self.assertEqual(payload["source_confidence"], "official")
@@ -158,6 +159,85 @@ class SECSourceTests(unittest.TestCase):
         self.assertIn(("balance_sheet", "cash_and_cash_equivalents"), facts)
         self.assertIn(("cash_flow", "operating_cash_flow"), facts)
         self.assertIn(("cash_flow", "capital_expenditure"), facts)
+
+    def test_companyfacts_keeps_current_period_fact_when_filing_has_comparatives(self):
+        source = SECSource(fetched_at="2026-01-01T00:00:00Z")
+
+        facts = source._companyfacts_to_facts(
+            {
+                "facts": {
+                    "us-gaap": {
+                        "NetIncomeLoss": {
+                            "units": {
+                                "USD": [
+                                    {
+                                        "fy": 2026,
+                                        "fp": "Q2",
+                                        "start": "2024-12-29",
+                                        "end": "2025-03-29",
+                                        "val": 24780000000,
+                                        "form": "10-Q",
+                                        "frame": "CY2025Q1",
+                                        "filed": "2026-05-01",
+                                    },
+                                    {
+                                        "fy": 2026,
+                                        "fp": "Q2",
+                                        "start": "2025-09-28",
+                                        "end": "2026-03-28",
+                                        "val": 71675000000,
+                                        "form": "10-Q",
+                                        "filed": "2026-05-01",
+                                    },
+                                    {
+                                        "fy": 2026,
+                                        "fp": "Q2",
+                                        "start": "2025-12-28",
+                                        "end": "2026-03-28",
+                                        "val": 29578000000,
+                                        "form": "10-Q",
+                                        "frame": "CY2026Q1",
+                                        "filed": "2026-05-01",
+                                    },
+                                ]
+                            }
+                        },
+                        "Assets": {
+                            "units": {
+                                "USD": [
+                                    {
+                                        "fy": 2026,
+                                        "fp": "Q2",
+                                        "end": "2025-09-27",
+                                        "val": 359241000000,
+                                        "form": "10-Q",
+                                        "frame": "CY2025Q3I",
+                                        "filed": "2026-05-01",
+                                    },
+                                    {
+                                        "fy": 2026,
+                                        "fp": "Q2",
+                                        "end": "2026-03-28",
+                                        "val": 371082000000,
+                                        "form": "10-Q",
+                                        "frame": "CY2026Q1I",
+                                        "filed": "2026-05-01",
+                                    },
+                                ]
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        values = {
+            (fact["statement_type"], fact["line_item"]): fact["value"]
+            for fact in facts
+        }
+        self.assertEqual(values[("income_statement", "net_income")], 29578000000)
+        self.assertEqual(values[("balance_sheet", "total_assets")], 371082000000)
+        self.assertEqual(len(facts), 2)
 
     def test_missing_symbol_raises_sec_source_error(self):
         source = SECSource(ticker_mapping={})

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import db
 from models import STATEMENT_TYPES
+import normalizer
 
 
 KEY_FIELDS = {
@@ -17,11 +18,42 @@ KEY_FIELD_RULES = {
     "cash_flow": "key_cash_flow_fields_present",
 }
 LARGE_CHANGE_MULTIPLE = 5
+QUALITY_RANK = {
+    "trusted": 0,
+    "usable": 1,
+    "needs_review": 2,
+    "stale": 3,
+    "failed": 4,
+}
 
 
-def _clear_prior_results(conn, checked_at: str) -> None:
-    conn.execute("delete from validation_results")
-    conn.execute("delete from data_quality_scores")
+def _clear_prior_results(
+    conn,
+    *,
+    company_ids: list[int] | None = None,
+    report_period: str | None = None,
+) -> None:
+    if not company_ids:
+        conn.execute("delete from validation_results")
+        conn.execute("delete from data_quality_scores")
+        return
+
+    placeholders = ", ".join("?" for _ in company_ids)
+    params: list[object] = list(company_ids)
+    result_where = [f"company_id in ({placeholders})"]
+    score_where = [f"company_id in ({placeholders})"]
+    if report_period:
+        result_where.append("(report_period = ? or report_period is null)")
+        score_where.append("report_period = ?")
+        params.append(report_period)
+    conn.execute(
+        f"delete from validation_results where {' and '.join(result_where)}",
+        params,
+    )
+    conn.execute(
+        f"delete from data_quality_scores where {' and '.join(score_where)}",
+        params,
+    )
 
 
 def _write_result(
@@ -56,7 +88,55 @@ def _quality_from_failures(error_count: int, warning_count: int) -> tuple[int, s
     return 95, "trusted"
 
 
-def _validate_key_fields(conn, company_id: int, facts, checked_at: str) -> int:
+def _worse_quality_status(left: str, right: str) -> str:
+    left_rank = QUALITY_RANK.get(left, QUALITY_RANK["needs_review"])
+    right_rank = QUALITY_RANK.get(right, QUALITY_RANK["needs_review"])
+    return left if left_rank >= right_rank else right
+
+
+def _sync_fact_validation_status(
+    conn,
+    company_id: int,
+    validation_status: str,
+    *,
+    report_period: str | None = None,
+) -> None:
+    params: list[object] = [company_id]
+    where = ["company_id = ?"]
+    if report_period:
+        where.append("report_period = ?")
+        params.append(report_period)
+    rows = conn.execute(
+        f"""
+        select id, quality_status
+        from financial_facts
+        where {' and '.join(where)}
+        """,
+        params,
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """
+            update financial_facts
+            set quality_status = ?, validation_status = ?
+            where id = ?
+            """,
+            (
+                _worse_quality_status(row["quality_status"], validation_status),
+                validation_status,
+                row["id"],
+            ),
+        )
+
+
+def _validate_key_fields(
+    conn,
+    company_id: int,
+    facts,
+    checked_at: str,
+    *,
+    report_period: str | None = None,
+) -> int:
     warnings = 0
     for statement_type, required_fields in KEY_FIELDS.items():
         statement_facts = [
@@ -77,6 +157,7 @@ def _validate_key_fields(conn, company_id: int, facts, checked_at: str) -> int:
                 status="warning",
                 severity="medium",
                 message="Missing key fields: " + ", ".join(missing),
+                report_period=report_period,
                 checked_at=checked_at,
             )
     return warnings
@@ -153,16 +234,27 @@ def _validate_large_changes(conn, company_id: int, facts, checked_at: str) -> in
     return warnings
 
 
-def _validate_payload_revisions(conn, company_id: int, checked_at: str) -> int:
+def _validate_payload_revisions(
+    conn,
+    company_id: int,
+    checked_at: str,
+    *,
+    report_period: str | None = None,
+) -> int:
+    params: list[object] = [company_id]
+    where = ["company_id = ?"]
+    if report_period:
+        where.append("report_period = ?")
+        params.append(report_period)
     revision_rows = conn.execute(
-        """
+        f"""
         select report_period, statement_type, line_item, count(distinct payload_hash) as n
         from financial_facts
-        where company_id = ?
+        where {' and '.join(where)}
         group by report_period, statement_type, line_item
         having count(distinct payload_hash) > 1
         """,
-        (company_id,),
+        params,
     ).fetchall()
     for row in revision_rows:
         _write_result(
@@ -181,22 +273,51 @@ def _validate_payload_revisions(conn, company_id: int, checked_at: str) -> int:
     return len(revision_rows)
 
 
-def run_validation(db_path: str | Path) -> dict[str, int]:
+def _normalize_optional_period(report_period: str | None) -> str | None:
+    if not report_period:
+        return None
+    normalized_period, _, _ = normalizer.normalize_report_period(report_period)
+    return normalized_period
+
+
+def run_validation(
+    db_path: str | Path,
+    *,
+    symbol: str | None = None,
+    report_period: str | None = None,
+) -> dict[str, int]:
     checked_at = db.utc_now()
+    normalized_symbol = symbol.strip().upper() if symbol else None
+    normalized_period = _normalize_optional_period(report_period)
     companies_checked = 0
     results_written = 0
     with db.connect(db_path) as conn:
-        _clear_prior_results(conn, checked_at)
+        company_params: list[object] = []
+        company_where = ["enabled = 1"]
+        if normalized_symbol:
+            company_where.append("symbol = ?")
+            company_params.append(normalized_symbol)
         companies = conn.execute(
-            "select id, symbol, market from companies where enabled = 1"
+            f"select id, symbol, market from companies where {' and '.join(company_where)}",
+            company_params,
         ).fetchall()
+        _clear_prior_results(
+            conn,
+            company_ids=[int(company["id"]) for company in companies] if (normalized_symbol or normalized_period) else None,
+            report_period=normalized_period,
+        )
 
         for company in companies:
             companies_checked += 1
             company_id = int(company["id"])
+            fact_params: list[object] = [company_id]
+            fact_where = ["company_id = ?"]
+            if normalized_period:
+                fact_where.append("report_period = ?")
+                fact_params.append(normalized_period)
             facts = conn.execute(
-                "select * from financial_facts where company_id = ?",
-                (company_id,),
+                f"select * from financial_facts where {' and '.join(fact_where)}",
+                fact_params,
             ).fetchall()
             error_count = 0
             warning_count = 0
@@ -210,6 +331,7 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                     status="warning",
                     severity="medium",
                     message="No financial facts found for enabled company",
+                    report_period=normalized_period,
                     checked_at=checked_at,
                 )
                 results_written += 1
@@ -225,6 +347,7 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                         status="warning",
                         severity="medium",
                         message="Missing statements: " + ", ".join(missing),
+                        report_period=normalized_period,
                         checked_at=checked_at,
                     )
                     results_written += 1
@@ -244,6 +367,7 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                             status="failed",
                             severity="high",
                             message=f"{missing_count} facts missing {field}",
+                            report_period=normalized_period,
                             checked_at=checked_at,
                         )
                         results_written += 1
@@ -263,19 +387,25 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                         status="warning",
                         severity="medium",
                         message=f"{stale_count} facts are marked stale",
+                        report_period=normalized_period,
                         checked_at=checked_at,
                     )
                     results_written += 1
 
+                duplicate_params: list[object] = [company_id]
+                duplicate_where = ["company_id = ?"]
+                if normalized_period:
+                    duplicate_where.append("report_period = ?")
+                    duplicate_params.append(normalized_period)
                 duplicate_rows = conn.execute(
-                    """
+                    f"""
                     select report_period, statement_type, line_item, count(*) as n
                     from financial_facts
-                    where company_id = ?
+                    where {' and '.join(duplicate_where)}
                     group by report_period, statement_type, line_item
                     having count(*) > 1
                     """,
-                    (company_id,),
+                    duplicate_params,
                 ).fetchall()
                 if duplicate_rows:
                     warning_count += 1
@@ -286,12 +416,17 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                         status="warning",
                         severity="low",
                         message=f"{len(duplicate_rows)} duplicate period rows detected",
+                        report_period=normalized_period,
                         checked_at=checked_at,
                     )
                     results_written += 1
 
                 key_field_warnings = _validate_key_fields(
-                    conn, company_id, facts, checked_at
+                    conn,
+                    company_id,
+                    facts,
+                    checked_at,
+                    report_period=normalized_period,
                 )
                 warning_count += key_field_warnings
                 results_written += key_field_warnings
@@ -309,31 +444,47 @@ def run_validation(db_path: str | Path) -> dict[str, int]:
                 results_written += large_change_warnings
 
                 revision_warnings = _validate_payload_revisions(
-                    conn, company_id, checked_at
+                    conn,
+                    company_id,
+                    checked_at,
+                    report_period=normalized_period,
                 )
                 warning_count += revision_warnings
                 results_written += revision_warnings
 
             score, status = _quality_from_failures(error_count, warning_count)
+            scope = "period" if normalized_period else "company"
             conn.execute(
                 """
                 insert into data_quality_scores(
                     company_id, scope, report_period, score, quality_status,
                     calculated_at
                 )
-                values(?, 'company', null, ?, ?, ?)
+                values(?, ?, ?, ?, ?, ?)
                 """,
-                (company_id, score, status, checked_at),
+                (company_id, scope, normalized_period, score, status, checked_at),
             )
-            conn.execute(
-                """
-                update companies
-                set data_status = ?, updated_at = ?
-                where id = ?
-                """,
-                (status, checked_at, company_id),
+            if not normalized_period:
+                conn.execute(
+                    """
+                    update companies
+                    set data_status = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (status, checked_at, company_id),
+                )
+            _sync_fact_validation_status(
+                conn,
+                company_id,
+                status,
+                report_period=normalized_period,
             )
 
         conn.commit()
 
-    return {"companies_checked": companies_checked, "results_written": results_written}
+    return {
+        "companies_checked": companies_checked,
+        "results_written": results_written,
+        "symbol": normalized_symbol,
+        "report_period": normalized_period,
+    }

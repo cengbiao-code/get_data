@@ -36,6 +36,7 @@ def _query_rows(
     db_path: str | Path,
     *,
     symbol: str | None,
+    report_period: str | None,
     statuses: list[str],
 ) -> list[dict[str, object]]:
     placeholders = ", ".join("?" for _ in statuses)
@@ -44,6 +45,9 @@ def _query_rows(
     if symbol:
         where.append("ff.company_symbol = ?")
         params.append(symbol.upper())
+    if report_period:
+        where.append("ff.report_period = ?")
+        params.append(report_period.upper())
 
     query = f"""
         select
@@ -82,16 +86,24 @@ def export_facts(
     out_dir: str | Path,
     *,
     symbol: str | None = None,
+    report_period: str | None = None,
     formats: list[str] | None = None,
     statuses: list[str] | None = None,
 ) -> dict[str, Path]:
     selected_formats = formats or ["csv"]
     selected_statuses = statuses or list(EXPORT_DEFAULT_STATUSES)
-    rows = _query_rows(db_path, symbol=symbol, statuses=selected_statuses)
+    rows = _query_rows(
+        db_path,
+        symbol=symbol,
+        report_period=report_period,
+        statuses=selected_statuses,
+    )
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
 
     stem = symbol.upper() if symbol else "financial_facts"
+    if report_period:
+        stem = f"{stem}_{report_period.upper()}"
     written: dict[str, Path] = {}
     if "csv" in selected_formats:
         csv_path = target / f"{stem}.csv"
@@ -109,4 +121,3 @@ def export_facts(
         written["jsonl"] = jsonl_path
 
     return written
-

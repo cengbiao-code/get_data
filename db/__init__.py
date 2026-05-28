@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .companies import get_company_id, sync_companies
+from .companies import get_company_id, sync_companies, update_company_name_if_placeholder
 from .connection import ClosingConnection, connect, utc_now
 from .facts import insert_financial_fact, insert_raw_payload
 from .quality import (
@@ -36,6 +36,7 @@ __all__ = [
     "refresh_freshness_from_disclosure_events",
     "refresh_freshness_from_facts",
     "sync_companies",
+    "update_company_name_if_placeholder",
     "upsert_crawler_source_compliance",
     "upsert_data_freshness",
     "utc_now",

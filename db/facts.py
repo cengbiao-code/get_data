@@ -37,6 +37,63 @@ def insert_raw_payload(db_path: str | Path, payload: dict[str, Any]) -> int:
 def insert_financial_fact(db_path: str | Path, fact: dict[str, Any]) -> int:
     with connect(db_path) as conn:
         company_id = get_company_id(conn, fact["company_symbol"], fact["market"])
+        existing = conn.execute(
+            """
+            select id, version
+            from financial_facts
+            where company_id = ?
+              and statement_type = ?
+              and report_period = ?
+              and line_item = ?
+              and payload_hash = ?
+            limit 1
+            """,
+            (
+                company_id,
+                fact["statement_type"],
+                fact["report_period"],
+                fact["line_item"],
+                fact["payload_hash"],
+            ),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                update financial_facts
+                set fiscal_year = ?,
+                    fiscal_period = ?,
+                    raw_line_item = ?,
+                    value = ?,
+                    unit = ?,
+                    currency = ?,
+                    source = ?,
+                    source_url = ?,
+                    source_confidence = ?,
+                    fetched_at = ?,
+                    quality_status = ?,
+                    freshness_status = ?,
+                    validation_status = ?
+                where id = ?
+                """,
+                (
+                    fact.get("fiscal_year"),
+                    fact.get("fiscal_period"),
+                    fact.get("raw_line_item"),
+                    fact.get("value"),
+                    fact.get("unit"),
+                    fact.get("currency"),
+                    fact["source"],
+                    fact.get("source_url"),
+                    fact["source_confidence"],
+                    fact["fetched_at"],
+                    fact.get("quality_status", "needs_review"),
+                    fact.get("freshness_status", "unknown"),
+                    fact.get("validation_status", "needs_review"),
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+            return int(existing["id"])
         duplicate_count = conn.execute(
             """
             select count(*) from financial_facts

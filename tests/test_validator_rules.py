@@ -82,7 +82,110 @@ class ValidatorRuleTests(unittest.TestCase):
             status = conn.execute(
                 "select data_status from companies where symbol = 'AAPL'"
             ).fetchone()["data_status"]
+            fact_status = conn.execute(
+                """
+                select quality_status, validation_status
+                from financial_facts
+                where company_symbol = 'AAPL'
+                """
+            ).fetchone()
         self.assertEqual(status, "needs_review")
+        self.assertEqual(fact_status["quality_status"], "needs_review")
+        self.assertEqual(fact_status["validation_status"], "needs_review")
+
+    def test_validation_does_not_upgrade_source_quality(self):
+        insert_fact(self.db_path, line_item="revenue", value=100)
+        insert_fact(self.db_path, line_item="net_income", value=20)
+        insert_fact(
+            self.db_path,
+            statement_type="balance_sheet",
+            line_item="total_assets",
+            value=100,
+        )
+        insert_fact(
+            self.db_path,
+            statement_type="balance_sheet",
+            line_item="total_liabilities",
+            value=40,
+        )
+        insert_fact(
+            self.db_path,
+            statement_type="balance_sheet",
+            line_item="total_equity",
+            value=60,
+        )
+        insert_fact(
+            self.db_path,
+            statement_type="cash_flow",
+            line_item="operating_cash_flow",
+            value=30,
+        )
+        with closing(db.connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                update financial_facts
+                set quality_status = 'usable', validation_status = 'needs_review'
+                where company_symbol = 'AAPL'
+                """
+            )
+            conn.commit()
+
+        validator.run_validation(self.db_path)
+
+        with closing(db.connect(self.db_path)) as conn:
+            fact_status = conn.execute(
+                """
+                select distinct quality_status, validation_status
+                from financial_facts
+                where company_symbol = 'AAPL'
+                """
+            ).fetchone()
+        self.assertEqual(fact_status["quality_status"], "usable")
+        self.assertEqual(fact_status["validation_status"], "trusted")
+
+    def test_validation_can_target_one_company_period(self):
+        insert_fact(
+            self.db_path,
+            report_period="2024Q4",
+            line_item="revenue",
+            value=100,
+        )
+        insert_fact(
+            self.db_path,
+            report_period="2025Q4",
+            line_item="revenue",
+            value=120,
+        )
+
+        summary = validator.run_validation(
+            self.db_path,
+            symbol="AAPL",
+            report_period="2025Q4",
+        )
+
+        with closing(db.connect(self.db_path)) as conn:
+            statuses = {
+                row["report_period"]: row["quality_status"]
+                for row in conn.execute(
+                    """
+                    select report_period, quality_status
+                    from financial_facts
+                    where company_symbol = 'AAPL'
+                    """
+                )
+            }
+            score = conn.execute(
+                """
+                select scope, report_period, quality_status
+                from data_quality_scores
+                """
+            ).fetchone()
+        self.assertEqual(summary["companies_checked"], 1)
+        self.assertEqual(summary["report_period"], "2025Q4")
+        self.assertEqual(statuses["2024Q4"], "trusted")
+        self.assertEqual(statuses["2025Q4"], "needs_review")
+        self.assertEqual(score["scope"], "period")
+        self.assertEqual(score["report_period"], "2025Q4")
 
     def test_balance_sheet_imbalance_flags_consistency_issue(self):
         insert_fact(
@@ -147,4 +250,3 @@ class ValidatorRuleTests(unittest.TestCase):
         names = self.rule_names()
         self.assertIn("duplicate_period_detected", names)
         self.assertIn("payload_revision_detected", names)
-

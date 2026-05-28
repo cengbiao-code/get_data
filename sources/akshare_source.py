@@ -47,6 +47,52 @@ class AKShareClient:
                 return function(stock=symbol, symbol=label)
         return function(stock=symbol)
 
+    def resolve_company_name(self, symbol: str, market: str) -> str | None:
+        try:
+            import akshare as ak
+        except ModuleNotFoundError:
+            return None
+
+        if market == "CN" and hasattr(ak, "stock_info_a_code_name"):
+            frame = ak.stock_info_a_code_name()
+            return self._name_from_frame(frame, symbol, code_columns=("code", "代码"), name_columns=("name", "名称"))
+        if market == "HK" and hasattr(ak, "stock_hk_spot_em"):
+            frame = ak.stock_hk_spot_em()
+            return self._name_from_frame(
+                frame,
+                symbol,
+                code_columns=("代码", "code", "证券代码"),
+                name_columns=("名称", "name", "证券简称"),
+            )
+        return None
+
+    def _name_from_frame(
+        self,
+        frame,
+        symbol: str,
+        *,
+        code_columns: tuple[str, ...],
+        name_columns: tuple[str, ...],
+    ) -> str | None:
+        if frame is None or getattr(frame, "empty", False):
+            return None
+        rows = frame.where(frame.notna(), None).to_dict(orient="records")
+        normalized_symbol = symbol.zfill(5) if len(symbol) <= 5 else symbol
+        for row in rows:
+            row_code = None
+            for column in code_columns:
+                if row.get(column) not in (None, ""):
+                    row_code = str(row[column]).strip()
+                    break
+            if row_code is None:
+                continue
+            if row_code.strip().zfill(len(normalized_symbol)) != normalized_symbol:
+                continue
+            for column in name_columns:
+                if row.get(column) not in (None, ""):
+                    return str(row[column]).strip()
+        return None
+
     def _cn_symbol(self, symbol: str) -> str:
         if symbol.startswith(("sh", "sz", "bj")):
             return symbol
@@ -83,6 +129,12 @@ class AKShareSource:
         "股东权益合计": "total_equity",
         "经营活动产生的现金流量净额": "operating_cash_flow",
     }
+    raw_line_item_priority = {
+        "营业收入": 100,
+        "营业总收入": 90,
+        "归属于母公司所有者的净利润": 100,
+        "净利润": 90,
+    }
 
     def __init__(self, *, client: Any | None = None, fetched_at: str | None = None) -> None:
         self.client = client or AKShareClient()
@@ -104,15 +156,18 @@ class AKShareSource:
         return statements
 
     def fetch(self, company) -> dict[str, Any]:
+        company_name = self._resolve_company_name(company.symbol, company.market)
         statements = self.fetch_financial_reports(company.symbol, company.market)
         facts = []
         payload_statements = {}
         for statement_type, frame in statements.items():
             rows = self._frame_to_rows(frame, statement_type)
+            rows = self._dedupe_statement_rows(rows)
             facts.extend(rows)
             payload_statements[statement_type] = rows
         return {
             "company_symbol": company.symbol,
+            "company_name": company_name,
             "market": company.market,
             "source": self.source_name,
             "source_url": None,
@@ -121,6 +176,15 @@ class AKShareSource:
             "facts": facts,
             "payload": {"statements": payload_statements},
         }
+
+    def _resolve_company_name(self, symbol: str, market: str) -> str | None:
+        resolver = getattr(self.client, "resolve_company_name", None)
+        if resolver is None:
+            return None
+        try:
+            return resolver(symbol, market)
+        except Exception:
+            return None
 
     def _frame_to_rows(self, frame: Any, statement_type: str) -> list[dict[str, Any]]:
         if frame is None or getattr(frame, "empty", False):
@@ -228,3 +292,27 @@ class AKShareSource:
             except ValueError:
                 return None
         return value
+
+    def _dedupe_statement_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for index, row in enumerate(rows):
+            key = (
+                str(row.get("statement_type") or ""),
+                str(row.get("report_period") or ""),
+                str(row.get("line_item") or ""),
+            )
+            current = selected.get(key)
+            if current is None or self._row_rank(row, index) > self._row_rank(current, current["_index"]):
+                selected[key] = {**row, "_index": index}
+        return [
+            {key: value for key, value in row.items() if key != "_index"}
+            for row in selected.values()
+        ]
+
+    def _row_rank(self, row: dict[str, Any], index: int) -> tuple:
+        raw_line_item = str(row.get("raw_line_item") or "")
+        return (
+            self.raw_line_item_priority.get(raw_line_item, 0),
+            1 if row.get("value") is not None else 0,
+            -index,
+        )

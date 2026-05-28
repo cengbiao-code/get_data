@@ -15,6 +15,15 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local listed-company financial database"
@@ -36,6 +45,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl.add_argument("--watchlist", required=True, help="CSV watchlist path")
     crawl.add_argument("--db", required=True, help="SQLite database path")
+
+    configure_crawler = subparsers.add_parser(
+        "configure-crawler-source", help="Configure crawler source compliance"
+    )
+    configure_crawler.add_argument("--db", required=True, help="SQLite database path")
+    configure_crawler.add_argument("--name", required=True, help="Crawler source name")
+    configure_crawler.add_argument("--market", required=True, help="Market code")
+    configure_crawler.add_argument(
+        "--compliance-status",
+        required=True,
+        choices=["unknown", "allowed", "permitted", "blocked"],
+        help="Compliance review status",
+    )
+    configure_crawler.add_argument(
+        "--enabled",
+        type=_parse_bool,
+        default=False,
+        help="Whether this source may be used: true or false",
+    )
+    configure_crawler.add_argument("--notes", default="", help="Compliance notes")
 
     review = subparsers.add_parser(
         "review-candidates", help="List unverified extracted candidates"
@@ -85,6 +114,26 @@ def main(argv: list[str] | None = None) -> int:
         db.init_db(args.db)
         summary = crawl_disclosures_from_watchlist(args.db, args.watchlist)
         print(summary)
+        return 0
+
+    if args.command == "configure-crawler-source":
+        db.init_db(args.db)
+        db.upsert_crawler_source_compliance(
+            args.db,
+            name=args.name,
+            market=args.market,
+            compliance_status=args.compliance_status,
+            enabled=args.enabled,
+            notes=args.notes,
+        )
+        print(
+            {
+                "name": args.name,
+                "market": args.market,
+                "enabled": args.enabled,
+                "compliance_status": args.compliance_status,
+            }
+        )
         return 0
 
     if args.command == "review-candidates":

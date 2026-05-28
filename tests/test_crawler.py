@@ -10,9 +10,9 @@ from crawler.base import (
     record_compliance_check,
     record_disabled_source,
 )
-from crawler.cninfo import CninfoCrawler
+from crawler.cninfo import AkshareCninfoClient, CninfoCrawler
 from crawler.document_store import save_crawler_document, save_extracted_candidate
-from crawler.runner import crawl_disclosures_from_watchlist
+from crawler.runner import crawl_disclosures_from_database, crawl_disclosures_from_watchlist
 
 
 class CrawlerLayerTests(unittest.TestCase):
@@ -267,6 +267,52 @@ class CrawlerLayerTests(unittest.TestCase):
         self.assertIn("1 disclosure", run["message"])
         self.assertEqual(fact_count, 0)
 
+    def test_akshare_cninfo_client_normalizes_financial_report_announcements(self):
+        class FakeFrame:
+            empty = False
+
+            def to_dict(self, orient):
+                self.orient = orient
+                return [
+                    {
+                        "代码": "600519",
+                        "简称": "贵州茅台",
+                        "公告标题": "贵州茅台2025年年度报告",
+                        "公告时间": "2026-04-30 00:00:00",
+                        "公告链接": "http://www.cninfo.com.cn/detail/1",
+                    },
+                    {
+                        "代码": "600519",
+                        "简称": "贵州茅台",
+                        "公告标题": "贵州茅台2025年第一季度报告",
+                        "公告时间": "2025-04-30 00:00:00",
+                        "公告链接": "http://www.cninfo.com.cn/detail/2",
+                    },
+                ]
+
+        calls = []
+
+        def fake_report_func(**kwargs):
+            calls.append(kwargs)
+            return FakeFrame()
+
+        client = AkshareCninfoClient(
+            report_func=fake_report_func,
+            today=lambda: "20260526",
+        )
+
+        announcements = client.fetch_announcements("600519")
+
+        self.assertEqual({call["category"] for call in calls}, {"年报", "半年报", "一季报", "三季报"})
+        self.assertTrue(all(call["symbol"] == "600519" for call in calls))
+        self.assertTrue(all(call["market"] == "沪深京" for call in calls))
+        self.assertTrue(all(call["end_date"] == "20260526" for call in calls))
+        self.assertEqual(announcements[0]["document_type"], "annual_report")
+        self.assertEqual(announcements[0]["report_period"], "2025Q4")
+        self.assertEqual(announcements[0]["disclosure_date"], "2026-04-30")
+        self.assertEqual(announcements[1]["document_type"], "quarterly_report")
+        self.assertEqual(announcements[1]["report_period"], "2025Q1")
+
     def test_crawl_disclosures_from_watchlist_runs_allowed_cn_crawler(self):
         watchlist_path = Path(self.tmp.name) / "watchlist.csv"
         watchlist_path.write_text(
@@ -314,5 +360,62 @@ class CrawlerLayerTests(unittest.TestCase):
                 "failure_count": 0,
                 "skipped_count": 1,
                 "documents_saved": 2,
+            },
+        )
+
+    def test_crawl_disclosures_from_database_runs_enabled_companies(self):
+        db.upsert_crawler_source_compliance(
+            self.db_path,
+            name="cninfo",
+            market="CN",
+            compliance_status="allowed",
+            enabled=True,
+        )
+        db.sync_companies(
+            self.db_path,
+            [
+                {
+                    "symbol": "AAPL",
+                    "market": "US",
+                    "name": "Apple Inc.",
+                    "enabled": True,
+                    "notes": "",
+                },
+                {
+                    "symbol": "000001",
+                    "market": "CN",
+                    "name": "平安银行",
+                    "enabled": False,
+                    "notes": "",
+                },
+            ],
+        )
+
+        class FakeCrawler:
+            source_name = "cninfo"
+
+            def __init__(self):
+                self.calls = []
+
+            def collect(self, db_path, *, symbol, market):
+                self.calls.append((symbol, market))
+                return 3
+
+        fake_crawler = FakeCrawler()
+
+        summary = crawl_disclosures_from_database(
+            self.db_path,
+            crawler_factory=lambda _company: fake_crawler,
+        )
+
+        self.assertEqual(fake_crawler.calls, [("600519", "CN")])
+        self.assertEqual(
+            summary,
+            {
+                "companies_loaded": 2,
+                "success_count": 1,
+                "failure_count": 0,
+                "skipped_count": 1,
+                "documents_saved": 3,
             },
         )

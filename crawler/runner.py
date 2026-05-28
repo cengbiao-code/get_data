@@ -7,7 +7,7 @@ import db
 from crawler.base import record_disabled_source
 from crawler.cninfo import CninfoCrawler
 from models import WatchlistCompany
-from watchlist import as_dicts, read_watchlist
+from watchlist import read_watchlist
 
 
 CrawlerFactory = Callable[[WatchlistCompany], object]
@@ -21,6 +21,32 @@ def crawl_disclosures_from_watchlist(
 ) -> dict[str, int]:
     companies = read_watchlist(watchlist_path)
     db.sync_companies(db_path, companies)
+    return crawl_disclosures_for_companies(
+        db_path,
+        companies,
+        crawler_factory=crawler_factory,
+    )
+
+
+def crawl_disclosures_from_database(
+    db_path: str | Path,
+    *,
+    crawler_factory: CrawlerFactory | None = None,
+) -> dict[str, int]:
+    companies = _enabled_companies(db_path)
+    return crawl_disclosures_for_companies(
+        db_path,
+        companies,
+        crawler_factory=crawler_factory,
+    )
+
+
+def crawl_disclosures_for_companies(
+    db_path: str | Path,
+    companies: list[WatchlistCompany],
+    *,
+    crawler_factory: CrawlerFactory | None = None,
+) -> dict[str, int]:
     factory = crawler_factory or _default_crawler_factory
     success_count = 0
     failure_count = 0
@@ -51,12 +77,34 @@ def crawl_disclosures_from_watchlist(
         success_count += 1
 
     return {
-        "companies_loaded": len(as_dicts(companies)),
+        "companies_loaded": len(companies),
         "success_count": success_count,
         "failure_count": failure_count,
         "skipped_count": skipped_count,
         "documents_saved": documents_saved,
     }
+
+
+def _enabled_companies(db_path: str | Path) -> list[WatchlistCompany]:
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            select symbol, market, name, enabled, notes
+            from companies
+            where enabled = 1
+            order by market, symbol
+            """
+        ).fetchall()
+    return [
+        WatchlistCompany(
+            row["symbol"],
+            row["market"],
+            row["name"],
+            bool(row["enabled"]),
+            row["notes"] or "",
+        )
+        for row in rows
+    ]
 
 
 def _crawler_for_company(company: WatchlistCompany, factory: CrawlerFactory):

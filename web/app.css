@@ -91,6 +91,7 @@ h3 { font-size: 15px; }
   gap: 16px;
   margin-bottom: 18px;
 }
+.crawler-action-panel { margin-bottom: 18px; }
 .form-card {
   padding: 18px;
   display: grid;
@@ -148,12 +149,33 @@ button:hover, .button-link:hover { background: var(--accent-strong); text-decora
 }
 .metric-value { display: block; font-size: 25px; font-weight: 800; }
 .metric-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+.quality-status-panel {
+  margin-bottom: 18px;
+  display: grid;
+  gap: 10px;
+}
 .quality-summary {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 18px;
 }
+.quality-help {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.quality-help strong { display: block; margin-bottom: 8px; }
+.quality-help ul {
+  display: grid;
+  gap: 6px;
+  padding: 0;
+  margin: 0 0 8px;
+  list-style: none;
+}
+.quality-help li { color: var(--muted); }
+.quality-help li span { color: var(--text); font-weight: 750; }
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -192,6 +214,11 @@ button:hover, .button-link:hover { background: var(--accent-strong); text-decora
 .company-list-panel .data-table th:nth-child(1) { width: 18%; }
 .company-list-panel .data-table th:nth-child(2) { width: 12%; }
 .company-list-panel .data-table th:nth-child(4) { width: 13%; }
+.company-summary-table.expanded .coverage-row td {
+  background: #fff;
+  padding: 8px 11px 12px;
+}
+.company-summary-table.expanded .coverage-row:hover { background: transparent; }
 .period-grid { display: grid; gap: 10px; }
 .period-card {
   border: 1px solid var(--border);
